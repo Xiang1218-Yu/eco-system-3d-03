@@ -5,13 +5,17 @@ import { computeFoodChainRelations } from '@/utils/ecosystemSimulator';
 import { SPECIES, TROPHIC_LEVEL_COLORS, getSpeciesById } from '@/data/species';
 
 export function FoodWebPanel() {
-  const organisms = useEcosystemStore((s) => s.organisms);
+  const populationBySpecies = useEcosystemStore((s) => s.stats.populationBySpecies);
 
   const { relations, presentSpecies } = useMemo(() => {
-    const rels = computeFoodChainRelations(organisms);
-    const species = [...new Set(organisms.map((o) => o.speciesId))];
-    return { relations: rels, presentSpecies: species };
-  }, [organisms]);
+    const species = SPECIES.filter((item) => populationBySpecies[item.id] > 0).map(
+      (item) => item.id,
+    );
+    return {
+      relations: computeFoodChainRelations(species),
+      presentSpecies: species,
+    };
+  }, [populationBySpecies]);
 
   const positions = useMemo(() => {
     const pos: Record<string, { x: number; y: number }> = {};

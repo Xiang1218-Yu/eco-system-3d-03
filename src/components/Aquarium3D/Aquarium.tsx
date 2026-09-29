@@ -1,4 +1,4 @@
-import { useRef, useMemo, useState } from 'react';
+import { useRef, useMemo } from 'react';
 import { Canvas, useFrame, ThreeEvent } from '@react-three/fiber';
 import { OrbitControls } from '@react-three/drei';
 import { EffectComposer, Bloom } from '@react-three/postprocessing';
@@ -287,7 +287,6 @@ interface Aquarium3DProps {
 
 export function Aquarium3D({ onAquariumClick }: Aquarium3DProps) {
   const { organisms } = useEcosystemStore();
-  const selectedSpeciesId = useEcosystemStore((s) => s.selectedSpeciesId);
 
   return (
     <Canvas

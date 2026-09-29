@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import type { Organism } from '@/types/ecosystem';
+import type { Organism, OrganismDeathCause, SimulationStepResult } from '@/types/ecosystem';
 import { getSpeciesById, SPECIES } from '@/data/species';
 import { AQUARIUM_BOUNDS } from '@/store/useEcosystemStore';
 
@@ -14,7 +14,7 @@ function distance(a: THREE.Vector3, b: THREE.Vector3): number {
 function findNearestPrey(
   organism: Organism,
   allOrganisms: Organism[],
-  excludedIds: Set<string>,
+  unavailableIds: Set<string>,
 ): Organism | null {
   const species = getSpeciesById(organism.speciesId);
   if (!species || species.diet.length === 0) return null;
@@ -24,7 +24,7 @@ function findNearestPrey(
 
   for (const other of allOrganisms) {
     if (other.id === organism.id) continue;
-    if (excludedIds.has(other.id)) continue;
+    if (unavailableIds.has(other.id)) continue;
     if (!species.diet.includes(other.speciesId)) continue;
 
     const dist = distance(organism.position, other.position);
@@ -85,25 +85,52 @@ function findNearestDead(
 
 export function simulateStep(
   organisms: Organism[],
-): {
-  updates: { id: string; updates: Partial<Organism> }[];
-  toRemove: string[];
-  toAdd: { speciesId: string; position: THREE.Vector3 }[];
-} {
+): SimulationStepResult {
   const updates: Map<string, Partial<Organism>> = new Map();
-  const toRemove: Set<string> = new Set();
-  const toAdd: { speciesId: string; position: THREE.Vector3 }[] = [];
-  const eatenPrey: Set<string> = new Set();
+  const unavailableIds = new Set<string>();
+  const removalReasons: Map<string, OrganismDeathCause> = new Map();
+  const births: { speciesId: string; position: THREE.Vector3 }[] = [];
+  const energyDeltas: Record<string, number> = {};
+  const energyDeltaByOrganism = new Map<string, number>();
+  const organismById = new Map(organisms.map((organism) => [organism.id, organism]));
+  const populationBySpecies = new Map<string, number>();
+  const removedCountBySpecies: Record<string, number> = {};
+  const pendingBirthCounts: Record<string, number> = {};
+
+  organisms.forEach((organism) => {
+    populationBySpecies.set(
+      organism.speciesId,
+      (populationBySpecies.get(organism.speciesId) || 0) + 1,
+    );
+  });
+
+  const removeOrganism = (id: string, cause: OrganismDeathCause) => {
+    if (!removalReasons.has(id)) {
+      const organism = organismById.get(id);
+      removalReasons.set(id, cause);
+      unavailableIds.add(id);
+      if (organism) {
+        removedCountBySpecies[organism.speciesId] =
+          (removedCountBySpecies[organism.speciesId] || 0) + 1;
+      }
+    }
+  };
 
   for (const organism of organisms) {
     const species = getSpeciesById(organism.speciesId);
     if (!species) continue;
 
+    if (removalReasons.has(organism.id)) continue;
+
     let energy = organism.energy;
     const age = organism.age + 1;
 
-    if (age >= species.lifespan || energy <= 0) {
-      toRemove.add(organism.id);
+    if (age >= species.lifespan) {
+      removeOrganism(organism.id, 'lifespan');
+      continue;
+    }
+    if (energy <= 0) {
+      removeOrganism(organism.id, 'starvation');
       continue;
     }
 
@@ -114,7 +141,7 @@ export function simulateStep(
     const newVelocity = organism.velocity.clone();
 
     if (species.trophicLevel === 'decomposer') {
-      const deadOrganism = findNearestDead(organism, organisms, toRemove);
+      const deadOrganism = findNearestDead(organism, organisms, unavailableIds);
 
       if (deadOrganism && energy < species.energyValue * 0.8) {
         organismUpdate.state = 'hunting';
@@ -172,7 +199,7 @@ export function simulateStep(
         organismUpdate.rotation = Math.atan2(newVelocity.x, newVelocity.z);
       }
     } else if (species.trophicLevel !== 'producer' && species.speed > 0) {
-      const prey = findNearestPrey(organism, organisms, eatenPrey);
+      const prey = findNearestPrey(organism, organisms, unavailableIds);
       const predator = findNearestPredator(organism, organisms);
 
       if (predator) {
@@ -191,8 +218,7 @@ export function simulateStep(
 
         if (distance(organism.position, prey.position) < species.size * 0.8) {
           energy += getSpeciesById(prey.speciesId)?.energyValue || 20;
-          eatenPrey.add(prey.id);
-          toRemove.add(prey.id);
+          removeOrganism(prey.id, 'predation');
           organismUpdate.state = 'eating';
         }
       } else {
@@ -251,10 +277,12 @@ export function simulateStep(
       energy > species.energyValue * 0.8 &&
       Math.random() < species.reproductionRate * 0.1
     ) {
-      const aliveCount = organisms.filter(
-        (o) => o.speciesId === organism.speciesId && !toRemove.has(o.id),
-      ).length;
+      const aliveCount =
+        (populationBySpecies.get(organism.speciesId) || 0) -
+        (removedCountBySpecies[organism.speciesId] || 0) +
+        (pendingBirthCounts[organism.speciesId] || 0);
       if (aliveCount < species.maxPopulation) {
+        pendingBirthCounts[species.id] = (pendingBirthCounts[species.id] || 0) + 1;
         const offspringPos = organism.position
           .clone()
           .add(
@@ -264,42 +292,57 @@ export function simulateStep(
               (Math.random() - 0.5) * 1.5,
             ),
           );
-        toAdd.push({ speciesId: organism.speciesId, position: offspringPos });
+        births.push({ speciesId: organism.speciesId, position: offspringPos });
         organismUpdate.energy = energy * 0.5;
       }
     }
+
+    const finalEnergy = organismUpdate.energy ?? energy;
+    energyDeltaByOrganism.set(organism.id, finalEnergy - organism.energy);
 
     updates.set(organism.id, organismUpdate);
   }
 
   const updatesArray: { id: string; updates: Partial<Organism> }[] = [];
   updates.forEach((u, id) => {
-    if (!toRemove.has(id)) {
+    if (!removalReasons.has(id)) {
       updatesArray.push({ id, updates: u });
     }
   });
 
-  return { updates: updatesArray, toRemove: Array.from(toRemove), toAdd };
+  energyDeltaByOrganism.forEach((delta, id) => {
+    if (removalReasons.has(id)) return;
+    const organism = organismById.get(id);
+    if (!organism) return;
+    energyDeltas[organism.speciesId] = (energyDeltas[organism.speciesId] || 0) + delta;
+  });
+
+  return {
+    updates: updatesArray,
+    removals: Array.from(removalReasons, ([id, cause]) => ({ id, cause })),
+    births,
+    energyDeltas,
+  };
 }
 
-export function computeFoodChainRelations(organisms: Organism[]): {
+export function computeFoodChainRelations(presentSpecies: string[]): {
   predatorId: string;
   preyId: string;
 }[] {
   const relations: { predatorId: string; preyId: string }[] = [];
   const seen = new Set<string>();
+  const presentSpeciesSet = new Set(presentSpecies);
 
-  for (const organism of organisms) {
-    const species = getSpeciesById(organism.speciesId);
+  for (const speciesId of presentSpecies) {
+    const species = getSpeciesById(speciesId);
     if (!species) continue;
 
     for (const preyId of species.diet) {
-      const hasPrey = organisms.some((o) => o.speciesId === preyId);
-      if (hasPrey) {
-        const key = `${organism.speciesId}-${preyId}`;
+      if (presentSpeciesSet.has(preyId)) {
+        const key = `${species.id}-${preyId}`;
         if (!seen.has(key)) {
           seen.add(key);
-          relations.push({ predatorId: organism.speciesId, preyId });
+          relations.push({ predatorId: species.id, preyId });
         }
       }
     }
