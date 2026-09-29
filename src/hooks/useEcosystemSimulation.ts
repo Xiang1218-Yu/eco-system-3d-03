@@ -7,10 +7,7 @@ export function useEcosystemSimulation() {
   const lastTimeRef = useRef<number>(0);
   const isRunningRef = useRef<boolean>(true);
 
-  const batchUpdateOrganisms = useEcosystemStore((s) => s.batchUpdateOrganisms);
-  const batchRemoveOrganisms = useEcosystemStore((s) => s.batchRemoveOrganisms);
-  const addOrganism = useEcosystemStore((s) => s.addOrganism);
-  const incrementTime = useEcosystemStore((s) => s.incrementTime);
+  const applySimulationResult = useEcosystemStore((s) => s.applySimulationResult);
   const isRunning = useEcosystemStore((s) => s.isRunning);
 
   useEffect(() => {
@@ -23,19 +20,8 @@ export function useEcosystemSimulation() {
         lastTimeRef.current = time;
 
         const organisms = useEcosystemStore.getState().organisms;
-        const { updates, toRemove, toAdd } = simulateStep(organisms);
-
-        if (updates.length > 0) {
-          batchUpdateOrganisms(updates);
-        }
-        if (toRemove.length > 0) {
-          batchRemoveOrganisms(toRemove);
-        }
-        toAdd.forEach(({ speciesId, position }) => {
-          addOrganism(speciesId, position);
-        });
-
-        incrementTime();
+        const result = simulateStep(organisms);
+        applySimulationResult(result);
       }
 
       frameRef.current = requestAnimationFrame(tick);
@@ -48,5 +34,5 @@ export function useEcosystemSimulation() {
         cancelAnimationFrame(frameRef.current);
       }
     };
-  }, [batchUpdateOrganisms, batchRemoveOrganisms, addOrganism, incrementTime]);
+  }, [applySimulationResult]);
 }

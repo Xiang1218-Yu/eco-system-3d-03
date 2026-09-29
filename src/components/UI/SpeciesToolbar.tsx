@@ -8,7 +8,7 @@ const LEVEL_ORDER: TrophicLevel[] = ['producer', 'herbivore', 'carnivore', 'deco
 export function SpeciesToolbar() {
   const selectedSpeciesId = useEcosystemStore((s) => s.selectedSpeciesId);
   const setSelectedSpecies = useEcosystemStore((s) => s.setSelectedSpecies);
-  const organisms = useEcosystemStore((s) => s.organisms);
+  const populationBySpecies = useEcosystemStore((s) => s.stats.populationBySpecies);
 
   return (
     <div className="absolute left-4 top-20 z-20 flex flex-col gap-2 max-h-[calc(100vh-28rem)] overflow-y-auto pr-2 pb-3 scrollbar-thin">
@@ -28,7 +28,7 @@ export function SpeciesToolbar() {
             <div className="flex flex-col gap-1.5">
               {levelSpecies.map((species) => {
                 const isSelected = selectedSpeciesId === species.id;
-                const count = organisms.filter((o) => o.speciesId === species.id).length;
+                const count = populationBySpecies[species.id] || 0;
                 return (
                   <GlassCard
                     key={species.id}

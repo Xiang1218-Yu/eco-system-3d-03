@@ -1,4 +1,4 @@
-import type { Species } from '@/types/ecosystem';
+import type { Species, TrophicLevel } from '@/types/ecosystem';
 
 export const SPECIES: Species[] = [
   {
@@ -137,6 +137,13 @@ export const SPECIES: Species[] = [
     energyValue: 5,
     maxPopulation: 8,
   },
+];
+
+export const TROPHIC_LEVELS: TrophicLevel[] = [
+  'producer',
+  'herbivore',
+  'carnivore',
+  'decomposer',
 ];
 
 export const TROPHIC_LEVEL_LABELS: Record<string, string> = {

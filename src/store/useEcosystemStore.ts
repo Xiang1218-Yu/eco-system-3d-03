@@ -1,10 +1,27 @@
 import { create } from 'zustand';
 import * as THREE from 'three';
-import type { Organism, EcosystemStats, Species } from '@/types/ecosystem';
-import { getSpeciesById, SPECIES } from '@/data/species';
+import type {
+  DeathCause,
+  EcosystemStats,
+  Organism,
+  SimulationResult,
+  Species,
+  TrophicLevel,
+} from '@/types/ecosystem';
+import { getSpeciesById, TROPHIC_LEVELS } from '@/data/species';
+import {
+  cloneStats,
+  createInitialStats,
+  finalizeStats,
+  recordEnergyDelta,
+  recordOrganismAdded,
+  recordOrganismRemoved,
+  VITAL_TREND_LIMIT,
+} from '@/utils/ecosystemStats';
 
 interface EcosystemStore {
   organisms: Organism[];
+  stats: EcosystemStats;
   selectedSpeciesId: string | null;
   selectedOrganismId: string | null;
   isRunning: boolean;
@@ -23,6 +40,7 @@ interface EcosystemStore {
   getStats: () => EcosystemStats;
   batchUpdateOrganisms: (updates: { id: string; updates: Partial<Organism> }[]) => void;
   batchRemoveOrganisms: (ids: string[]) => void;
+  applySimulationResult: (result: SimulationResult) => void;
 }
 
 const AQUARIUM_BOUNDS = {
@@ -74,8 +92,13 @@ function createOrganism(speciesId: string, position?: THREE.Vector3): Organism |
   };
 }
 
+function createLevelDeltas(): Record<TrophicLevel, number> {
+  return { producer: 0, herbivore: 0, carnivore: 0, decomposer: 0 };
+}
+
 export const useEcosystemStore = create<EcosystemStore>((set, get) => ({
   organisms: [],
+  stats: createInitialStats(),
   selectedSpeciesId: null,
   selectedOrganismId: null,
   isRunning: true,
@@ -87,47 +110,216 @@ export const useEcosystemStore = create<EcosystemStore>((set, get) => ({
     const species = getSpeciesById(speciesId);
     if (!species) return;
 
-    const currentCount = state.organisms.filter((o) => o.speciesId === speciesId).length;
+    const currentCount = state.stats.populationBySpecies[speciesId] || 0;
     if (currentCount >= species.maxPopulation) return;
 
     const organism = createOrganism(speciesId, position);
     if (organism) {
-      set((prev) => ({ organisms: [...prev.organisms, organism] }));
+      set((prev) => ({
+        organisms: [...prev.organisms, organism],
+        stats: recordOrganismAdded(
+          prev.stats,
+          speciesId,
+          species.trophicLevel,
+          organism.energy,
+        ),
+      }));
     }
   },
 
   removeOrganism: (organismId) => {
+    const organism = get().organisms.find((o) => o.id === organismId);
+    if (!organism) return;
+    const species = getSpeciesById(organism.speciesId);
+
     set((prev) => ({
       organisms: prev.organisms.filter((o) => o.id !== organismId),
       selectedOrganismId: prev.selectedOrganismId === organismId ? null : prev.selectedOrganismId,
+      stats: species
+        ? recordOrganismRemoved(
+            prev.stats,
+            organism.speciesId,
+            species.trophicLevel,
+            organism.energy,
+          )
+        : prev.stats,
     }));
   },
 
   updateOrganism: (organismId, updates) => {
-    set((prev) => ({
-      organisms: prev.organisms.map((o) => (o.id === organismId ? { ...o, ...updates } : o)),
-    }));
+    set((prev) => {
+      const current = prev.organisms.find((o) => o.id === organismId);
+      if (!current) return prev;
+
+      const species = getSpeciesById(current.speciesId);
+      const energyDelta =
+        species && typeof updates.energy === 'number' ? updates.energy - current.energy : 0;
+
+      return {
+        organisms: prev.organisms.map((o) => (o.id === organismId ? { ...o, ...updates } : o)),
+        stats: species
+          ? recordEnergyDelta(prev.stats, species.trophicLevel, energyDelta)
+          : prev.stats,
+      };
+    });
   },
 
   batchUpdateOrganisms: (updates) => {
     set((prev) => {
       const updateMap = new Map(updates.map((u) => [u.id, u.updates]));
-      return {
-        organisms: prev.organisms.map((o) => {
-          const update = updateMap.get(o.id);
-          return update ? { ...o, ...update } : o;
-        }),
-      };
+      const levelDeltas = createLevelDeltas();
+
+      const organisms = prev.organisms.map((organism) => {
+        const update = updateMap.get(organism.id);
+        if (!update) return organism;
+
+        if (typeof update.energy === 'number') {
+          const species = getSpeciesById(organism.speciesId);
+          if (species) {
+            levelDeltas[species.trophicLevel] += update.energy - organism.energy;
+          }
+        }
+        return { ...organism, ...update };
+      });
+
+      let stats = prev.stats;
+      if (TROPHIC_LEVELS.some((level) => levelDeltas[level] !== 0)) {
+        stats = cloneStats(prev.stats);
+        TROPHIC_LEVELS.forEach((level) => {
+          stats.energyPyramid[level].energy += levelDeltas[level];
+        });
+        stats = finalizeStats(stats);
+      }
+
+      return { organisms, stats };
     });
   },
 
   batchRemoveOrganisms: (ids) => {
     const idSet = new Set(ids);
-    set((prev) => ({
-      organisms: prev.organisms.filter((o) => !idSet.has(o.id)),
-      selectedOrganismId:
-        prev.selectedOrganismId && idSet.has(prev.selectedOrganismId) ? null : prev.selectedOrganismId,
-    }));
+    set((prev) => {
+      const stats = cloneStats(prev.stats);
+      let statsChanged = false;
+
+      const organisms = prev.organisms.filter((organism) => {
+        if (!idSet.has(organism.id)) return true;
+
+        const species = getSpeciesById(organism.speciesId);
+        if (species) {
+          stats.populationBySpecies[organism.speciesId] = Math.max(
+            0,
+            (stats.populationBySpecies[organism.speciesId] || 0) - 1,
+          );
+          stats.totalOrganisms = Math.max(0, stats.totalOrganisms - 1);
+          stats.energyPyramid[species.trophicLevel].population = Math.max(
+            0,
+            stats.energyPyramid[species.trophicLevel].population - 1,
+          );
+          stats.energyPyramid[species.trophicLevel].energy -= organism.energy;
+          statsChanged = true;
+        }
+        return false;
+      });
+
+      return {
+        organisms,
+        selectedOrganismId:
+          prev.selectedOrganismId && idSet.has(prev.selectedOrganismId)
+            ? null
+            : prev.selectedOrganismId,
+        stats: statsChanged ? finalizeStats(stats) : prev.stats,
+      };
+    });
+  },
+
+  applySimulationResult: ({ updates, toRemove, toAdd }) => {
+    set((prev) => {
+      const updateMap = new Map(updates.map((u) => [u.id, u.updates]));
+      const removalMap = new Map(toRemove.map((removal) => [removal.id, removal.cause]));
+      const organismById = new Map(prev.organisms.map((organism) => [organism.id, organism]));
+      const levelDeltas = createLevelDeltas();
+
+      let stats = cloneStats(prev.stats);
+      let births = 0;
+      let deaths = 0;
+
+      const survivingOrganisms = prev.organisms
+        .filter((organism) => !removalMap.has(organism.id))
+        .map((organism) => {
+          const update = updateMap.get(organism.id);
+          if (!update) return organism;
+
+          if (typeof update.energy === 'number') {
+            const species = getSpeciesById(organism.speciesId);
+            if (species) {
+              levelDeltas[species.trophicLevel] += update.energy - organism.energy;
+            }
+          }
+          return { ...organism, ...update };
+        });
+
+      removalMap.forEach((cause: DeathCause, organismId) => {
+        const organism = organismById.get(organismId);
+        if (!organism) return;
+
+        const species = getSpeciesById(organism.speciesId);
+        if (!species) return;
+
+        deaths += 1;
+        stats.deathsByCause[cause] += 1;
+        stats.populationBySpecies[organism.speciesId] = Math.max(
+          0,
+          (stats.populationBySpecies[organism.speciesId] || 0) - 1,
+        );
+        stats.totalOrganisms = Math.max(0, stats.totalOrganisms - 1);
+        stats.energyPyramid[species.trophicLevel].population = Math.max(
+          0,
+          stats.energyPyramid[species.trophicLevel].population - 1,
+        );
+        stats.energyPyramid[species.trophicLevel].energy -= organism.energy;
+      });
+
+      TROPHIC_LEVELS.forEach((level) => {
+        stats.energyPyramid[level].energy += levelDeltas[level];
+      });
+
+      const newOrganisms: Organism[] = [];
+      toAdd.forEach(({ speciesId, position }) => {
+        const species = getSpeciesById(speciesId);
+        if (!species) return;
+        if ((stats.populationBySpecies[speciesId] || 0) >= species.maxPopulation) return;
+
+        const organism = createOrganism(speciesId, position);
+        if (!organism) return;
+
+        births += 1;
+        stats.populationBySpecies[speciesId] =
+          (stats.populationBySpecies[speciesId] || 0) + 1;
+        stats.totalOrganisms += 1;
+        stats.energyPyramid[species.trophicLevel].population += 1;
+        stats.energyPyramid[species.trophicLevel].energy += organism.energy;
+        newOrganisms.push(organism);
+      });
+
+      stats.time += 1;
+      stats.birthCount += births;
+      stats.deathCount += deaths;
+      stats.vitalTrends = [
+        ...stats.vitalTrends,
+        { time: stats.time, births, deaths },
+      ].slice(-VITAL_TREND_LIMIT);
+      stats = finalizeStats(stats);
+
+      return {
+        organisms: [...survivingOrganisms, ...newOrganisms],
+        stats,
+        simulationTime: stats.time,
+        selectedOrganismId:
+          prev.selectedOrganismId && removalMap.has(prev.selectedOrganismId)
+            ? null
+            : prev.selectedOrganismId,
+      };
+    });
   },
 
   setSelectedSpecies: (speciesId) => {
@@ -139,16 +331,23 @@ export const useEcosystemStore = create<EcosystemStore>((set, get) => ({
   },
 
   toggleSimulation: () => {
-    set((prev) => ({ isRunning: !prev.isRunning }));
+    set((prev) => {
+      const isRunning = !prev.isRunning;
+      return { isRunning, stats: { ...prev.stats, isRunning } };
+    });
   },
 
   incrementTime: () => {
-    set((prev) => ({ simulationTime: prev.simulationTime + 1 }));
+    set((prev) => ({
+      simulationTime: prev.simulationTime + 1,
+      stats: { ...prev.stats, time: prev.stats.time + 1 },
+    }));
   },
 
   resetEcosystem: () => {
     set({
       organisms: [],
+      stats: createInitialStats(),
       selectedSpeciesId: null,
       selectedOrganismId: null,
       simulationTime: 0,
@@ -162,39 +361,10 @@ export const useEcosystemStore = create<EcosystemStore>((set, get) => ({
 
   getStats: () => {
     const state = get();
-    const populationBySpecies: Record<string, number> = {};
-    SPECIES.forEach((s) => {
-      populationBySpecies[s.id] = 0;
-    });
-    state.organisms.forEach((o) => {
-      populationBySpecies[o.speciesId] = (populationBySpecies[o.speciesId] || 0) + 1;
-    });
-
-    let balanceIndex = 0;
-    const levels = ['producer', 'herbivore', 'carnivore', 'decomposer'];
-    const levelCounts: Record<string, number> = { producer: 0, herbivore: 0, carnivore: 0, decomposer: 0 };
-    state.organisms.forEach((o) => {
-      const sp = getSpeciesById(o.speciesId);
-      if (sp) levelCounts[sp.trophicLevel]++;
-    });
-
-    const total = state.organisms.length;
-    if (total > 0) {
-      const idealRatios = { producer: 0.5, herbivore: 0.3, carnivore: 0.1, decomposer: 0.1 };
-      let deviation = 0;
-      levels.forEach((level) => {
-        const actual = levelCounts[level] / total;
-        deviation += Math.abs(actual - idealRatios[level]);
-      });
-      balanceIndex = Math.max(0, 100 - deviation * 100);
-    }
-
     return {
+      ...state.stats,
       time: state.simulationTime,
       isRunning: state.isRunning,
-      balanceIndex,
-      populationBySpecies,
-      totalOrganisms: total,
     };
   },
 }));
